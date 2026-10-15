@@ -1,7 +1,7 @@
 ## Interface: 30300
 ## Title: |cff1784d1E|r|cffe5e3e3lvUI|r |cff1784d1D|r|cffe5e3e3mg|r |cff1784d1A|r|cffe5e3e3t|r |cff1784d1N|r|cffe5e3e3ameplates|r
 ## Author: fxpw
-## Version: 1.15
+## Version: 1.16
 ## Notes: Show combat text at nameplates
 ## Notes-ruRU: Показывает цифорки красивые на неймплейтах
 ## RequiredDeps: ElvUI

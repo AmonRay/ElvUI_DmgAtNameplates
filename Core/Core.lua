@@ -38,15 +38,9 @@ local AutoAttack = select(1, GetSpellInfo(6603))
 local AutoAttackPet = select(1, GetSpellInfo(315235))
 
 local AutoShot = select(1, GetSpellInfo(75))
-local isPlayerEvent
-local isTargetEvent
-local isPetEvent
-local unitToUnitEvent
-local playerToUnitEvent
-local unitToPlayerEvent
-local playerToPlayerEvent
 local targetUnitType
 DAN.DmgTextFrame = CreateFrame("Frame", nil, UIParent)
+DAN.DmgTextFrame:SetFrameStrata("MEDIUM")
 
 DAN.ElvUI_ToPlayerFrame = CreateFrame("Frame","ElvUI_ToPlayerFrame", UIParent)
 DAN.ElvUI_ToPlayerFrame:SetPoint("CENTER",UIParent,"CENTER",300,0)
@@ -98,9 +92,9 @@ local MISS_EVENT_STRINGS = {
 	["RESIST"] = L["Resisted"]
 }
 
-local sReturn
 function DAN:GetUnitTypeByFlag(flag)
-	sReturn = ""
+	local sReturn = ""
+	flag = flag or 0
 	if band(flag, COMBATLOG_OBJECT_TYPE_PLAYER) > 0 then
 		sReturn = "Player"
 	elseif band (flag, COMBATLOG_OBJECT_TYPE_NPC) > 0 then
@@ -142,7 +136,6 @@ local mse = {
 	SPELL_PERIODIC_MISSED = true,
 	RANGE_MISSED = true,
 	SPELL_BUILDING_MISSED = true,
-	-- SWING_MISSED = true
 }
 -- heal spell events
 local hse = {
@@ -161,64 +154,118 @@ function DAN:GetFontPath(fontName)
 	local fontPath = LSM:Fetch("font", fontName) or "Fonts\\FRIZQT__.TTF"
 	return fontPath
 end
-function DAN:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag)
-	-- isPlayerEvent = pguid == whoguid
-	-- isPetEvent = bit.band(whoflag, BITMASK_PETS) > 0 and bit.band(whoflag, COMBATLOG_OBJECT_AFFILIATION_MINE) > 0
-	-- playerToUnitEvent = isPlayerEvent and tguid ~= pguid
-	-- unitToPlayerEvent = not isPlayerEvent and tguid == pguid
-	if playerToUnitEvent then
-		return (tguid and NP.PlateGUID[tguid]) or (isTargetEvent and self.ElvUI_ToTargetFrame)
-	elseif unitToPlayerEvent then
-		return self.ElvUI_ToPlayerFrame
-	elseif isPetEvent then
-		return (tguid and NP.PlateGUID[tguid]) or (isTargetEvent and self.ElvUI_ToTargetFrame)
-	elseif playerToPlayerEvent then
-		return self.ElvUI_ToPlayerFrame
+-- A GUID index avoids scanning all visible plates for every combat-log hit.
+-- The tables belong to this addon; no fields or scripts of client plates change.
+local platesByGUID, guidByPlate = {}, {}
+-- Short, bounded negative cache: unknown GUIDs must not trigger a full scan
+-- for every hit. Plate lifecycle hooks invalidate it immediately; expiry also
+-- recovers changes made by older ElvUI/other addons without those hooks.
+local missingPlates, missingCount, missingUntil = {}, 0, 0
+local MISSING_PLATE_TTL, MISSING_PLATE_LIMIT = 0.1, 128
+local function ClearMissingPlates()
+	for guid in pairs(missingPlates) do missingPlates[guid] = nil end
+	missingCount, missingUntil = 0, 0
+end
+local function PlateFrame(plate)
+	return plate and (plate.ElvUIFrame or plate)
+end
+
+local function ForgetPlate(plate)
+	ClearMissingPlates()
+	local frame = PlateFrame(plate)
+	local guid = frame and guidByPlate[frame]
+	if guid and platesByGUID[guid] == frame then platesByGUID[guid] = nil end
+	if frame then guidByPlate[frame] = nil end
+end
+
+local function IndexPlate(plate)
+	local frame = PlateFrame(plate)
+	ForgetPlate(plate)
+	if frame and frame.guid and frame:IsShown() then
+		platesByGUID[frame.guid] = frame
+		guidByPlate[frame] = frame.guid
 	end
-	return nil
+end
+
+local function ValidPlate(frame, guid)
+	return frame and frame:IsShown() and frame.guid == guid
+		and (not frame.unit or UnitGUID(frame.unit) == guid)
+end
+
+function DAN:InitializePlateIndex()
+	if self.plateIndexInitialized then return end
+	self.plateIndexInitialized = true
+	if NP.OnShow then hooksecurefunc(NP, "OnShow", IndexPlate) end
+	if NP.OnHide then hooksecurefunc(NP, "OnHide", ForgetPlate) end
+	for frame in pairs(NP.VisiblePlates or {}) do IndexPlate(frame) end
+end
+
+function DAN:GetNameplateFrame(guid)
+	if not guid then return end
+	local frame = platesByGUID[guid]
+	if ValidPlate(frame, guid) then return frame end
+	if frame then ForgetPlate(frame) end
+
+	-- Compatibility with old ElvUI, plus recovery when the plugin starts after
+	-- plates are shown or another plugin changes their visibility.
+	frame = PlateFrame(NP.PlateGUID and NP.PlateGUID[guid])
+	if ValidPlate(frame, guid) then IndexPlate(frame) return frame end
+	local now = GetTime()
+	if now >= missingUntil then
+		ClearMissingPlates()
+		missingUntil = now + MISSING_PLATE_TTL
+	end
+	if missingPlates[guid] then return end
+	for visible in pairs(NP.VisiblePlates or {}) do
+		if ValidPlate(visible, guid) then IndexPlate(visible) return visible end
+	end
+	if missingCount < MISSING_PLATE_LIMIT then
+		missingPlates[guid] = true
+		missingCount = missingCount + 1
+	end
+end
+function DAN:GetFrame(whoguid, whoname, whoflag, tguid, tname, tflag)
+	if not pguid or not tguid then return end
+	if tguid == pguid then return self.ElvUI_ToPlayerFrame end
+	if whoguid == pguid or self:IsSourceMyPet(whoguid, whoflag) then
+		local frame = self:GetNameplateFrame(tguid)
+		if frame then return frame end
+		if UnitGUID("target") == tguid then return self.ElvUI_ToTargetFrame end
+	end
 end
 local useRandomCoords = true
 
 local fontStringCache = {}
-local frameCounter = 0
 function DAN:GetFontString(frame)
 	local fontString, fontStringFrame
 
 	if next(fontStringCache) then
 		fontString = tremove(fontStringCache)
 	else
-		frameCounter = frameCounter + 1
-		fontStringFrame = CreateFrame("Frame", nil, UIParent)
-		fontStringFrame:SetFrameStrata("HIGH")
-		fontStringFrame:SetFrameLevel(frameCounter)
+		fontStringFrame = CreateFrame("Frame", nil, DAN.DmgTextFrame)
+		fontStringFrame:SetFrameLevel(DAN.DmgTextFrame:GetFrameLevel() + 1)
 		fontString = fontStringFrame:CreateFontString()
 		fontString:SetParent(fontStringFrame)
-	end
-	fontString:SetFont(DAN:GetFontPath(self.db.font),self.db.fontSize,self.db.fontOutline)
-	fontString:SetShadowOffset(0, 0)
+		fontString:SetShadowOffset(0, 0)
+		end
 
 	fontString:SetAlpha(1)
-	fontString:SetDrawLayer("BACKGROUND")
-	fontString:SetText("")
+	fontString:SetDrawLayer("OVERLAY")
 	fontString:Show()
 
-
 	if not fontString.icon then
-		fontString.icon = DAN.DmgTextFrame:CreateTexture(nil, "BACKGROUND")
+		fontString.icon = DAN.DmgTextFrame:CreateTexture(nil, "OVERLAY")
 		fontString.icon:SetTexCoord(0.062, 0.938, 0.062, 0.938)
 	end
 	fontString.icon:SetAlpha(1)
-	fontString.icon:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
 	fontString.icon:Hide()
 	local x,y = frame:GetSize()
-	x = math.random(-(x/2),(x/2))
-	y = math.random(-(y/2),(y/2))
+	x = mtrn(-mtfl(x / 2), mtfl(x / 2))
+	y = mtrn(-mtfl(y / 2), mtfl(y / 2))
 	fontString.startX = useRandomCoords and x or 0
 	fontString.startY = useRandomCoords and y or 0
 
-		-- if fontString.icon.button then
-		-- 	fontString.icon.button:Show()
-		-- 
+		--
 
 	return fontString
 end
@@ -239,13 +286,17 @@ function DAN:DeleteFontString(fontString)
 	fontString.animatingDuration = nil
 	fontString.animatingStartTime = nil
 	fontString.anchorFrame = nil
+	fontString.nameplateFrame = nil
+	fontString.anchorGUID = nil
 	fontString.startX = nil
 	fontString.startY = nil
-
 
 	fontString.pow = nil
 	fontString.startHeight = nil
 	fontString.DANFontSize = nil
+	fontString.DANText = nil
+	fontString.fontPath, fontString.fontOutline, fontString.startAlpha = nil, nil, nil
+	fontString.rainfallX, fontString.rainfallStartY = nil, nil
 
 	if fontString.icon then
 		fontString.icon:ClearAllPoints()
@@ -260,23 +311,10 @@ function DAN:DeleteFontString(fontString)
 
 	end
 
-	fontString:SetFont(DAN:GetFontPath(self.db.font),self.db.fontSize,self.db.fontOutline)
-
-	fontString:SetShadowOffset(0, 0)
-
 	fontString:ClearAllPoints()
 
 	tinsert(fontStringCache, fontString)
 end
-
-local STRATAS = {
-	"BACKGROUND",
-	"LOW",
-	"MEDIUM",
-	"HIGH",
-	"DIALOG",
-	"TOOLTIP"
-}
 
 local function verticalPath(elapsed, duration, distance)
 	return 0, LibEasing.InQuad(elapsed, 0, distance, duration)
@@ -309,29 +347,22 @@ local function powSizing(elapsed, duration, start, middle, finish)
 end
 
 local function AnimationOnUpdate()
+	local now = GetTime()
 	if next(animating) then
 		for fontString, _ in pairs(animating) do
-			local elapsed = GetTime() - fontString.animatingStartTime
-			if elapsed > fontString.animatingDuration then
+			local elapsed = now - fontString.animatingStartTime
+			local plate = fontString.nameplateFrame
+			if elapsed > fontString.animatingDuration or (plate and
+				(not plate:IsShown() or plate.guid ~= fontString.anchorGUID
+				or (plate.unit and UnitGUID(plate.unit) ~= fontString.anchorGUID))) then
 				DAN:DeleteFontString(fontString)
 			else
-				local isTarget = false
-
-				local frame = fontString:GetParent()
-				local currentStrata = frame:GetFrameStrata()
-				local strataRequired = "MEDIUM"
-				if currentStrata ~= strataRequired then
-					frame:SetFrameStrata(strataRequired)
-				end
-
-				local startAlpha = 1
-
-
+				local startAlpha = fontString.startAlpha or 1
 				local alpha = LibEasing.InExpo(elapsed, startAlpha, -startAlpha, fontString.animatingDuration)
 				fontString:SetAlpha(alpha)
+				if fontString.icon and fontString.icon:IsShown() then fontString.icon:SetAlpha(alpha) end
 
 				if fontString.pow then
-					local iconScale = 1
 					local height = fontString.startHeight
 					if elapsed < fontString.animatingDuration / 6 then
 						fontString:SetText(fontString.DANText)
@@ -341,9 +372,8 @@ local function AnimationOnUpdate()
 					else
 						fontString.pow = nil
 						fontString:SetTextHeight(height)
-						fontString:SetFont(E.db.DmgAtNameplates.font,E.db.DmgAtNameplates.fontSize,E.db.DmgAtNameplates.fontOutline)
-						fontString:SetShadowOffset(0, 0)
-						fontString:SetText(fontString.DANText)
+						fontString:SetFont(fontString.fontPath, fontString.DANFontSize, fontString.fontOutline)
+											fontString:SetText(fontString.DANText)
 					end
 				end
 
@@ -406,19 +436,21 @@ function DAN:Animate(fontString, anchorFrame, duration, animation)
 end
 
 function DAN:DisplayText(f, text, size, alpha, animation, spellId, pow, spellName,etype)
-	if not f then return end
+	if not f or animation == "disabled" then return end
 	local fontString
 	local icon
 
 	fontString = self:GetFontString(f)
 
 	fontString.DANText = text
-	fontString:SetText(fontString.DANText)
 
 	fontString.DANFontSize = size
-	fontString:SetFont(self:GetFontPath(etype and self.db[etype].font or self.db.font), size, etype and self.db[etype].fontOutline or self.db.fontOutline)
-
-	fontString:SetShadowOffset(0, 0)
+	fontString.fontPath = self:GetFontPath(etype and self.db[etype].font or self.db.font)
+	fontString.fontOutline = etype and self.db[etype].fontOutline or self.db.fontOutline
+	fontString.startAlpha = alpha or 1
+	fontString:SetAlpha(fontString.startAlpha)
+	fontString:SetFont(fontString.fontPath, size, fontString.fontOutline)
+	fontString:SetText(fontString.DANText)
 
 	fontString.startHeight = fontString:GetStringHeight()
 	fontString.pow = pow
@@ -427,9 +459,8 @@ function DAN:DisplayText(f, text, size, alpha, animation, spellId, pow, spellNam
 		fontString.startHeight = 5
 	end
 
-
 	local texture = select(3, GetSpellInfo(spellId or spellName))
-	if not texture then
+	if not texture and spellName then
 		texture = select(3, GetSpellInfo(spellName))
 	end
 
@@ -446,7 +477,11 @@ function DAN:DisplayText(f, text, size, alpha, animation, spellId, pow, spellNam
 			fontString.icon:Hide()
 		end
 	end
-	self:Animate(fontString, f, self.db.duration, animation)
+	-- Use the visible ElvUI health bar, not the hidden Blizzard UnitFrame.
+	local anchor = f.Health and f.Health:IsShown() and f.Health or f
+	fontString.nameplateFrame = f.guid and f or nil
+	fontString.anchorGUID = f.guid
+	self:Animate(fontString, anchor, self.db.duration, animation)
 end
 
 local numDamageEvents = 0
@@ -531,7 +566,6 @@ function DAN:DamageEvent(f, spellName, amount, school, crit, spellId, whog, whoN
 end
 
 function DAN:HealEvent(f, spllname, slldmg, healcrt, splld, vrhll)
-	-- print(f, spllname, slldmg, healcrt, splld, vrhll)
 	if not f then return end
 
 	----------------------- animation
@@ -575,11 +609,10 @@ end
 
 function DAN:MissEvent(f, spellName, missType, spellId)
 	if not f then return end
-	-- local text, animation, pow, size, alpha, color
 	animation = self.db.miss.animation or "verticalDown"
 	color = self.db.miss.color or "ffff00"
 	size = self.db.miss.fontSize or 20
-	alpha = 1
+	alpha = self.db.miss.fontAlpha or 1
 	pow = true
 	if missType == "ABSORB" then
 		return
@@ -587,7 +620,7 @@ function DAN:MissEvent(f, spellName, missType, spellId)
 	text = MISS_EVENT_STRINGS[missType] or ACTION_SPELL_MISSED_MISS
 	text = "|cff" .. color .. text .. "|r"
 
-	self:DisplayText(f, text, size, alpha, animation, spellId, pow, spellName, "dispel")
+	self:DisplayText(f, text, size, alpha, animation, spellId, pow, spellName, "miss")
 end
 
 function DAN:MissEventPet(f, spellName, missType, spellId)
@@ -595,7 +628,7 @@ function DAN:MissEventPet(f, spellName, missType, spellId)
 	animation = self.db.miss.animation or "verticalDown"
 	color = self.db.miss.color or "ffff00"
 	size = self.db.miss.fontSize or 20
-	alpha = 1
+	alpha = self.db.miss.fontAlpha or 1
 	pow = true
 	if missType == "ABSORB" then
 		return
@@ -610,7 +643,7 @@ function DAN:DispelEvent(f, spellName, infodis, spellId)
 	animation = self.db.dispel.animation or "verticalDown"
 	color = self.db.dispel.color or "ffff00"
 	size = self.db.dispel.fontSize or 20
-	alpha = 1
+	alpha = self.db.dispel.fontAlpha or 1
 	pow = false
 	text = "|cff" .. color .. infodis .. "|r"
 	self:DisplayText(f, text, size, alpha, animation, spellId, pow, spellName,"dispel")
@@ -621,16 +654,22 @@ function DAN:SpellInterruptEvent(f,  spllname, splld, intrspll)
 	animation = self.db.interrupt.animation or "verticalDown"
 	color = self.db.interrupt.color or "ffff00"
 	size = self.db.interrupt.fontSize or 20
-	alpha = 1
+	alpha = self.db.interrupt.fontAlpha or 1
 	pow = true
 	text = "Прервано ".."{"..intrspll.."}"
 	text = "|cff" .. color .. text .. "|r"
 	self:DisplayText(f, text, size, alpha, animation, splld, pow, spllname,"interrupt")
 end
 
+local relevantEvents = { SWING_DAMAGE = true, SWING_MISSED = true, SPELL_DISPEL = true }
+for _, events in ipairs({ dse, mse, hse, csi }) do
+	for event in pairs(events) do relevantEvents[event] = true end
+end
+
 local BITMASK_PETS = COMBATLOG_OBJECT_TYPE_PET + COMBATLOG_OBJECT_TYPE_GUARDIAN
 
 function DAN:IsSourceMyPet(whoguid, whoflag)
+	whoflag = whoflag or 0
 	if (band(whoflag, BITMASK_PETS) > 0) and (band(whoflag, COMBATLOG_OBJECT_AFFILIATION_MINE) > 0) then
 		return true
 	end
@@ -646,79 +685,75 @@ function DAN:IsSourceMyPet(whoguid, whoflag)
 	return false
 end
 
--- local args1,args2,subevent,whoguid,whoname,whoflag,tguid,tname,tflag,spellid,spellname,spellschool,amount,overHeal_Kill,args15,args16,args17,args18,dmgCrit,args20
-
 function DAN:FilterEvent(args1,args2,subevent,whoguid,whoname,whoflag,tguid,tname,tflag,spellid,spellname,spellschool,amount,overHeal_Kill,args15,args16,args17,args18,dmgCrit)
-	local db = self.db or E.db.DmgAtNameplates
-	if not db or not db.enable then return end
-	-- print("rab")
-	-- args1,args2,subevent,whoguid,whoname,whoflag,tguid,tname,tflag,spellid,spellname,spellschool,amount,overHeal_Kill,args15,args16,args17,args18,dmgCrit,args20 =...
-	-- local vnt1,tm2,sbvnt3,guidwhcst4,whcst5,flags6,tgtguid7,tgtcst8,_,splld10,spllname11,schl12,slldmg13,infodis14,intrspll15,healcrt16,_,_,crt19,_,_,_,_,_,_,_ = ...
+	local db = E.db.DmgAtNameplates
+	self.db = db
+	if not db or not db.enable or not relevantEvents[subevent] then return end
 	-- local args = {...}
-	-- for k,v in pairs(args) do
-	-- 	print(k,v)
 	-- end
-	isPlayerEvent = pguid == whoguid;
-	isTargetEvent = UnitExists("target") and (UnitGUID("target") == tguid);
-	isPetEvent = self:IsSourceMyPet(whoguid, whoflag)
-	playerToUnitEvent = isPlayerEvent and (tguid ~= pguid);
-	unitToPlayerEvent = not isPlayerEvent and (tguid == pguid);
-	unitToUnitEvent = not isPlayerEvent and (tguid ~= pguid);
-	playerToPlayerEvent = isPlayerEvent and (tguid == pguid);
+	local isPlayerEvent = pguid == whoguid;
+	local isPetEvent = self:IsSourceMyPet(whoguid, whoflag)
+	local playerToUnitEvent = isPlayerEvent and (tguid ~= pguid);
+	local unitToPlayerEvent = not isPlayerEvent and (tguid == pguid);
 	targetUnitType = self:GetUnitTypeByFlag(tflag);
 
+	-- The Sirus/3.3.5 combat log has a different payload for melee attacks:
+	-- SWING_DAMAGE: amount, overkill, school, resisted, blocked, absorbed, crit.
+	-- SWING_MISSED: missType, offHand. Normalize without allocating a table.
+	local swingDamage, swingMiss = subevent == "SWING_DAMAGE", subevent == "SWING_MISSED"
+	if swingDamage or swingMiss then
+		amount = spellid
+		spellname = isPetEvent and AutoAttackPet or AutoAttack
+		spellschool = 1
+		spellid = isPetEvent and 315235 or 6603
+		if swingDamage then dmgCrit = args16 end
+	end
+	local damageEvent = dse[subevent] or swingDamage
+	local missEvent = mse[subevent] or swingMiss
+
 	if isPetEvent then
-		if dse[subevent] and db.petToTargetDamageText then
-			self:DamageEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), spellname, amount, "pet", dmgCrit, spellid, isPlayerEvent, whoname)
-		elseif subevent == "SWING_DAMAGE" and db.petToTargetDamageText then
-			self:DamageEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), AutoAttackPet, spellid, "pet", dmgCrit, 315235, isPlayerEvent, whoname)
-		elseif mse[subevent] and db.petToTargetDamageText then
+		if damageEvent and db.petToTargetDamageText then
+			self:DamageEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), spellname, amount, "pet", dmgCrit, spellid, whoguid, whoname)
+		elseif missEvent and db.petToTargetDamageText then
 			self:MissEventPet(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), spellname, amount, spellid)
 		elseif hse[subevent] and db.petToTargetHealText then
 			self:HealEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), spellname, amount, args16, spellid,overHeal_Kill)
 		end
-	elseif playerToUnitEvent or (unitToUnitEvent and db.showFromAnotherPlayer) then -- player to target or unit to target
-		if dse[subevent] and db.playerToTargetDamageText then
+	elseif playerToUnitEvent then
+		if damageEvent and db.playerToTargetDamageText then
 			self:DamageEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), spellname, amount, spellschool, dmgCrit, spellid, whoguid, whoname)
-		elseif subevent == "SWING_DAMAGE" and db.playerToTargetDamageText  then
-			self:DamageEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), AutoAttack, spellid, 1, dmgCrit, 6603, whoguid, whoname)
-		elseif mse[subevent] and db.playerToTargetDamageText  then
+		elseif missEvent and db.playerToTargetDamageText then
 			self:MissEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), spellname, amount, spellid)
-		elseif  subevent == "SPELL_DISPEL" and db.playerToTargetDamageText  then
+		elseif subevent == "SPELL_DISPEL" and db.playerToTargetDamageText then
 			self:DispelEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), spellname, overHeal_Kill, amount)
 		elseif hse[subevent] and db.playerToTargetHealText then
 			self:HealEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), spellname, amount, args16, spellid,overHeal_Kill)
 		elseif csi[subevent] and db.playerToTargetDamageText then
 			self:SpellInterruptEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), spellname,spellid,overHeal_Kill)
-		elseif subevent == "SWING_MISSED" and db.playerToTargetDamageText then
-			self:MissEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), AutoAttack, AutoAttack , 6603)
 		end
 	elseif unitToPlayerEvent or isPlayerEvent then
-		if dse[subevent] and db.targetToPlayerDamageText then
+		if damageEvent and db.targetToPlayerDamageText then
 			self:DamageEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), spellname, amount, spellschool, dmgCrit, spellid, whoguid, whoname)
-		elseif subevent == "SWING_DAMAGE" and db.targetToPlayerDamageText then
-			self:DamageEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), AutoAttack, spellid, 1, dmgCrit, 660, whoguid, whoname)
-		elseif mse[subevent] and db.targetToPlayerDamageText then
+		elseif missEvent and db.targetToPlayerDamageText then
 			self:MissEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), spellname, amount, spellid)
-		elseif  subevent == "SPELL_DISPEL" and db.targetToPlayerDamageText then
+		elseif subevent == "SPELL_DISPEL" and db.targetToPlayerDamageText then
 			self:DispelEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), spellname, overHeal_Kill, amount)
 		elseif hse[subevent] and db.targetToPlayerHealText then
 			self:HealEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), spellname, amount, args16, spellid,overHeal_Kill)
 		elseif csi[subevent] and db.targetToPlayerDamageText then
 			self:SpellInterruptEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), spellname,spellid,overHeal_Kill)
-		elseif subevent == "SWING_MISSED" and db.targetToPlayerDamageText then
-			self:MissEvent(self:GetFrame(whoguid,whoname,whoflag,tguid,tname,tflag), AutoAttack, AutoAttack , 6603)
 		end
 	end
 end
 
 function DAN:PLAYER_ENTERING_WORLD(...)
+	ClearMissingPlates()
 	self:UnregisterEvent("PLAYER_ENTERING_WORLD")
 
 	pguid = UnitGUID("player")
 	self.DmgTextFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
-	self.DmgTextFrame:SetScript("OnEvent",function(event,...)
-		self:FilterEvent(...)
+	self.DmgTextFrame:SetScript("OnEvent", function(_, event, ...)
+		self:FilterEvent(event, ...)
 	end)
 	self.db = E.db.DmgAtNameplates
 	E:CreateMover(self.ElvUI_ToPlayerFrame, "PlayerDMGFrame", L["PlayerDMGFrame"], nil, nil, nil, "ALL", nil, "DmgAtNameplates");
@@ -726,27 +761,35 @@ function DAN:PLAYER_ENTERING_WORLD(...)
 end
 
 function DAN:PLAYER_TALENT_UPDATE(event)
-	if self.activeSpec ~= C_Talent.GetSpecInfoCache().activeTalentGroup then
+	local cache = C_Talent and C_Talent.GetSpecInfoCache and C_Talent.GetSpecInfoCache()
+	if cache and self.activeSpec ~= cache.activeTalentGroup then
 		self.db = E.db.DmgAtNameplates
-		self.activeSpec = C_Talent.GetSpecInfoCache().activeTalentGroup
+		self.activeSpec = cache.activeTalentGroup
 	end
 end
 
 function DAN:OnDisable()
+	ClearMissingPlates()
 	-- if not E.db.DmgAtNameplates.onorof then
 	self.DmgTextFrame:UnregisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+	for fontString in pairs(animating) do self:DeleteFontString(fontString) end
+	self.DmgTextFrame:SetScript("OnUpdate", nil)
 end
 function DAN:OnEnable()
+	ClearMissingPlates()
 	-- if E.db.DmgAtNameplates.onorof then
 	self.DmgTextFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
-	self.DmgTextFrame:SetScript("OnEvent",function(event,...)
-		self:FilterEvent(...)
+	self.DmgTextFrame:SetScript("OnEvent", function(_, event, ...)
+		self:FilterEvent(event, ...)
 	end)
 end
 
 function DAN:Initialize()
+	self:InitializePlateIndex()
 	EP:RegisterPlugin(DAN.AddOnName, self.DmgAtNameplatesOptions)
-	self.activeSpec = C_Talent.GetSpecInfoCache() and C_Talent.GetSpecInfoCache().activeTalentGroup or 1
+	local cache = C_Talent and C_Talent.GetSpecInfoCache and C_Talent.GetSpecInfoCache()
+	self.activeSpec = cache and cache.activeTalentGroup or 1
+	self.db = E.db.DmgAtNameplates
 	-- self.db = E.db
 	self:RegisterEvent("PLAYER_ENTERING_WORLD")
 	self:RegisterEvent("PLAYER_TALENT_UPDATE")
